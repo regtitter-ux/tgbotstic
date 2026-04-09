@@ -263,6 +263,7 @@ def _convert_tgs(input_path: str, w: int, h: int) -> Optional[bytes]:
             timeout=60,
         )
         stderr = result.stderr.decode(errors="replace").strip()
+        stdout = result.stdout.decode(errors="replace").strip()
         if result.returncode == 0 and os.path.exists(output_path):
             logger.info("TGS subprocess: %s", stderr)
             with open(output_path, "rb") as f:
@@ -270,14 +271,15 @@ def _convert_tgs(input_path: str, w: int, h: int) -> Optional[bytes]:
             os.remove(output_path)
             return data
         else:
-            logger.error("TGS subprocess failed (exit %d): %s", result.returncode, stderr)
-            return None
+            detail = stderr or stdout or f"exit code {result.returncode}"
+            logger.error("TGS subprocess failed (exit %d): %s", result.returncode, detail)
+            raise RuntimeError(detail)
     except subprocess.TimeoutExpired:
-        logger.error("TGS conversion timed out")
-        return None
+        raise RuntimeError("TGS conversion timed out")
+    except RuntimeError:
+        raise
     except Exception as e:
-        logger.error("TGS → GIF: %s", e)
-        return None
+        raise RuntimeError(str(e)) from e
 
 def _prepare_emoji_gif(data: bytes, size: int, frame_step: int = 1) -> bytes:
     """Resize GIF to size×size, optionally keeping only every frame_step-th frame."""
@@ -365,7 +367,7 @@ class DiscordClient(discord.Client):
                     os.remove(tmp_path)
 
             if not gif_bytes:
-                await status.edit(content="Не удалось конвертировать TGS в GIF.")
+                await status.edit(content="Не удалось конвертировать TGS в GIF (пустой результат).")
                 return
 
             await status.delete()
@@ -598,7 +600,11 @@ async def _convert_sticker_obj(sticker, w: int, h: int) -> tuple[Optional[bytes]
             path = os.path.join(tmpdir, "s.tgs")
             await file_obj.download_to_drive(path)
             logger.info("Скачан .tgs (%d bytes), конвертирую...", os.path.getsize(path))
-            gif = await loop.run_in_executor(None, _convert_tgs, path, w, h)
+            try:
+                gif = await loop.run_in_executor(None, _convert_tgs, path, w, h)
+            except RuntimeError as e:
+                logger.error("TGS failed: %s", e)
+                gif = None
             kind = "анимированный стикер"
         else:
             path = os.path.join(tmpdir, "s.webp")
