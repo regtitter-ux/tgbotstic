@@ -247,6 +247,39 @@ def _convert_webm(input_path: str, w: int, h: int) -> Optional[bytes]:
         return None
 
 
+def _tgs_bytes_to_gif(tgs_bytes: bytes, w: int, h: int) -> bytes:
+    """Convert TGS bytes → GIF bytes inline (no subprocess) via rlottie-python."""
+    import gzip
+    import rlottie_python as rl
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        json_path = tmp.name
+    try:
+        with gzip.open(io.BytesIO(tgs_bytes), "rb") as f:
+            with open(json_path, "wb") as out:
+                out.write(f.read())
+
+        anim = rl.LottieAnimation.from_file(json_path)
+        total_frames: int = anim.lottie_animation_get_totalframe()
+        fps: float = anim.lottie_animation_get_framerate()
+        duration_ms = max(1, int(1000 / fps))
+
+        frames = []
+        for i in range(total_frames):
+            buf = anim.lottie_animation_render(i, w, h)
+            img = Image.frombytes("RGBA", (w, h), bytes(buf))
+            r, g, b, a = img.split()
+            frames.append(Image.merge("RGBA", (b, g, r, a)))  # BGRA → RGBA
+    finally:
+        if os.path.exists(json_path):
+            os.remove(json_path)
+
+    if not frames:
+        raise RuntimeError("rlottie вернул 0 кадров")
+
+    return _frames_to_gif(frames, [duration_ms] * len(frames))
+
+
 def _convert_tgs(input_path: str, w: int, h: int) -> Optional[bytes]:
     """Animated sticker (.tgs) → GIF.
     Runs rlottie in a separate subprocess to isolate segfaults from the main process.
@@ -354,21 +387,9 @@ class DiscordClient(discord.Client):
         status = await message.channel.send(f"Конвертирую `{attachment.filename}`...")
         try:
             tgs_bytes = await attachment.read()
-            with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
-                tmp.write(tgs_bytes)
-                tmp_path = tmp.name
-
-            try:
-                gif_bytes = await loop.run_in_executor(
-                    None, _convert_tgs, tmp_path, DEFAULT_SIZE, DEFAULT_SIZE
-                )
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-
-            if not gif_bytes:
-                await status.edit(content="Не удалось конвертировать TGS в GIF (пустой результат).")
-                return
+            gif_bytes = await loop.run_in_executor(
+                None, _tgs_bytes_to_gif, tgs_bytes, DEFAULT_SIZE, DEFAULT_SIZE
+            )
 
             await status.delete()
 
@@ -386,8 +407,8 @@ class DiscordClient(discord.Client):
                     await message.channel.send("Не удалось создать эмодзи (слишком большой или нет прав).")
 
         except Exception as e:
-            logger.error("_handle_tgs_attachment: %s", e)
-            await status.edit(content=f"Ошибка: {e}")
+            logger.error("_handle_tgs_attachment: %s", e, exc_info=True)
+            await status.edit(content=f"Ошибка конвертации: ```{e}```")
 
     async def _process_queue(self):
         global emoji_server_id
