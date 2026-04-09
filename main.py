@@ -293,7 +293,7 @@ def _convert_tgs(input_path: str, w: int, h: int) -> Optional[bytes]:
         result = subprocess.run(
             [sys.executable, converter, input_path, str(w), str(h), output_path],
             capture_output=True,
-            timeout=60,
+            timeout=40,
         )
         stderr = result.stderr.decode(errors="replace").strip()
         stdout = result.stdout.decode(errors="replace").strip()
@@ -387,9 +387,18 @@ class DiscordClient(discord.Client):
         status = await message.channel.send(f"Конвертирую `{attachment.filename}`...")
         try:
             tgs_bytes = await attachment.read()
-            gif_bytes = await loop.run_in_executor(
-                None, _tgs_bytes_to_gif, tgs_bytes, DEFAULT_SIZE, DEFAULT_SIZE
-            )
+            with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
+                tmp.write(tgs_bytes)
+                tmp_path = tmp.name
+            try:
+                # subprocess с timeout=45 — убивает процесс если rlottie завис
+                gif_bytes = await asyncio.wait_for(
+                    loop.run_in_executor(None, _convert_tgs, tmp_path, DEFAULT_SIZE, DEFAULT_SIZE),
+                    timeout=45,
+                )
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
             await status.delete()
 
@@ -406,6 +415,9 @@ class DiscordClient(discord.Client):
                 else:
                     await message.channel.send("Не удалось создать эмодзи (слишком большой или нет прав).")
 
+        except asyncio.TimeoutError:
+            logger.error("TGS conversion timed out for %s", attachment.filename)
+            await status.edit(content="Конвертация зависла (таймаут 45 сек). Попробуй другой файл.")
         except Exception as e:
             logger.error("_handle_tgs_attachment: %s", e, exc_info=True)
             await status.edit(content=f"Ошибка конвертации: ```{e}```")
