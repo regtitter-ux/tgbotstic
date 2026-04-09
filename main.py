@@ -305,11 +305,87 @@ class DiscordClient(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.guilds = True
+        intents.message_content = True
+        intents.messages = True
         super().__init__(intents=intents)
+        self._monitored_channels: set[int] = set()
 
     async def on_ready(self):
         logger.info("Discord бот запущен как %s", self.user)
         self.loop.create_task(self._process_queue())
+
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+
+        # !stic — включить/выключить мониторинг канала
+        if message.content.strip().lower() == "!stic":
+            cid = message.channel.id
+            if cid in self._monitored_channels:
+                self._monitored_channels.discard(cid)
+                await message.channel.send("Мониторинг TGS в этом канале **отключён**.")
+                logger.info("Мониторинг отключён для канала %s", cid)
+            else:
+                self._monitored_channels.add(cid)
+                await message.channel.send(
+                    "Мониторинг TGS в этом канале **включён**. "
+                    "Отправляй `.tgs` файлы — получишь GIF и эмодзи на сервер."
+                )
+                logger.info("Мониторинг включён для канала %s", cid)
+            return
+
+        # Обработка TGS вложений в мониторируемых каналах
+        if message.channel.id not in self._monitored_channels:
+            return
+        if not message.attachments:
+            return
+
+        for attachment in message.attachments:
+            if not attachment.filename.lower().endswith(".tgs"):
+                continue
+            await self._handle_tgs_attachment(message, attachment)
+
+    async def _handle_tgs_attachment(
+        self, message: discord.Message, attachment: discord.Attachment
+    ):
+        loop = asyncio.get_running_loop()
+        status = await message.channel.send(f"Конвертирую `{attachment.filename}`...")
+        try:
+            tgs_bytes = await attachment.read()
+            with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
+                tmp.write(tgs_bytes)
+                tmp_path = tmp.name
+
+            try:
+                gif_bytes = await loop.run_in_executor(
+                    None, _convert_tgs, tmp_path, DEFAULT_SIZE, DEFAULT_SIZE
+                )
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+            if not gif_bytes:
+                await status.edit(content="Не удалось конвертировать TGS в GIF.")
+                return
+
+            await status.delete()
+
+            # Отправить GIF в канал
+            await message.channel.send(
+                file=discord.File(io.BytesIO(gif_bytes), filename="sticker.gif")
+            )
+
+            # Загрузить как эмодзи на сервер, где отправлено сообщение
+            if message.guild:
+                emoji = await self._upload_emoji(message.guild, gif_bytes)
+                if emoji:
+                    await message.channel.send(f"Эмодзи добавлен: <:{emoji.name}:{emoji.id}>")
+                else:
+                    await message.channel.send("Не удалось создать эмодзи (слишком большой или нет прав).")
+
+        except Exception as e:
+            logger.error("_handle_tgs_attachment: %s", e)
+            await status.edit(content=f"Ошибка: {e}")
 
     async def _process_queue(self):
         global emoji_server_id
